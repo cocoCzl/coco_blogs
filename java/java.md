@@ -67,3 +67,62 @@ builder.redirectError(new File("error.txt"));
 了解平台上缓冲区的大小限制，并通过适当的设计减少大规模的数据交互，例如限制单次读写的数据量，或分批次进行数据传输。
 ### 总结
 当父进程没有及时读取子进程的输出流，或者没有及时向子进程提供输入时，操作系统的缓冲区会被填满，从而导致进程的阻塞，甚至死锁。为了避免这些问题，我们可以使用线程异步处理流数据、使用适当的缓冲区管理，并确保进程间的输入输出能顺畅进行。
+
+## Kubernetes CPU 限额的默认测量周期和YGC的问题
+在 Kubernetes（k8s）中，CPU 限额的默认测量周期（即指标收集和限制生效的时间窗口）是 100 毫秒（ms）。
+
+### 问题：
+容器设置的是4C，然后宿主机器是128C。因为某些原因导致<font style="color:rgba(0, 0, 0, 0.85);">Kubernetes 的 CPU 限制无法被 JVM 感知（例如使用了较旧的 JDK 版本，或未启用相关特性），JVM 将根据 </font>**宿主机的总 CPU 核心数**<font style="color:rgba(0, 0, 0, 0.85);"> 来计算 GC 线程数量，而非容器的 CPU 配额。</font>
+
+### <font style="color:rgb(0, 0, 0);">Kubernetes CPU 限额详细说明：</font>
+1. **CPU 限额的核心机制**  
+   Kubernetes 对容器的 CPU 资源限制（`resources.limits.cpu`）是通过 CGroup（控制组）实现的。CGroup 的 CPU 限制会跟踪容器在单位时间内的 CPU 使用量，并确保不超过设定的限额。
+2. **默认周期的作用**  
+   100 毫秒是 CGroup v1 中默认的 CPU 时间片周期（`cpu.cfs_period_us`，单位为微秒，100ms = 100000us）。在每个周期内，容器最多可使用的 CPU 时间由 `cpu.cfs_quota_us` 定义（例如，1 核 CPU 的限额对应 `quota = 100000us`，即填满整个周期）。
+3. **周期与限额的关系**
+    - 若容器的 CPU 限额为 `0.5` 核（500m），则 `quota = 50000us`，意味着每个 100ms 周期内最多使用 50ms 的 CPU 时间。
+    - 周期长度（100ms）是固定的，限额通过调整每个周期内的可用时间（quota）来实现。
+4. **是否可配置？**  
+   是的，周期（`cpu.cfs_period_us`）和限额（`cpu.cfs_quota_us`）均可通过 CGroup 配置调整，但 Kubernetes 并未直接暴露这两个参数的 API，默认使用 100ms 周期。实际使用中，用户通常只需通过 `limits.cpu` 设定限额，无需修改周期。
+
+总结：k8s 中 CPU 限额的默认测量周期为 **100 毫秒**，这是由 CGroup 机制决定的基础时间窗口。
+
+### GC线程数<font style="color:rgb(0, 0, 0);">详细说明：</font>
+#### 1. 并行垃圾回收器(ParallelGC):
+ParallelGCThreads:这个参数指定了用于垃圾回收的并行线程数。
+
+计算公式:
+
+当CPU核心数小于等于8时，ParallelGCThreads 等于CPU核心数。
+
+当CPU核心数大于8时，ParallelGCThreads 的计算公式为：ParallelGCThreads = 8 + ((CPU核心数- 8) * 5/8)。
+
+#### 2. 并发垃圾回收器(CMS):
+ParallelGCThreads:
+
+用于STW (Stop-The-World) 暂停时，进行并行垃圾回收的线程数。
+
+ConcGCThreads:
+
+用于并发标记和清理阶段，与应用程序交替执行的线程数。
+
+#### 计算公式:
+ParallelGCThreads 的计算方式与并行垃圾回收器类似，根据CPU核心数进行调整.
+
+ConcGCThreads 的默认值通常是`(ParallelGCThreads + 3) / 4` 。
+
+#### 示例:
+假设一个系统有16个CPU核心：
+
+对于并行GC，ParallelGCThreads 大约会是：8 + ((16 - 8) * 5/8) = 13。
+
+对于CMS，ParallelGCThreads 也会是13，而 ConcGCThreads 大约会是：(13 + 3) / 4 = 4。
+
+总结:
+
+GC线程数的设置对垃圾回收的性能有重要影响。合理的线程数设置可以减少垃圾回收的停顿时间，提高应用程序的响应速度。在实际应用中，可以根据具体的硬件配置和应用场景，通过调整 ParallelGCThreads 和 ConcGCThreads 等参数来优化GC性能。
+
+### 解决方法
+```java
+-XX:ParallelGCThreads=4  # 根据容器配额手动计算
+```
